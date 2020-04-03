@@ -70,6 +70,7 @@
 
 #include <yocto/yocto_image.h>
 #include <yocto/yocto_math.h>
+#include <yocto/yocto_common.h>
 
 #include <atomic>
 #include <future>
