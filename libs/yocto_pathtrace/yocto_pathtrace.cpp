@@ -804,7 +804,18 @@ static vec3f eval_delta(const ptr::brdf& brdf, const vec3f& normal,
     const vec3f& outgoing, const vec3f& incoming) {
   if (brdf.roughness) return zero3f;
   // YOUR CODE GOES HERE ------------------------------------------------------
-  return {};
+  auto brdfcos = zero3f;
+  // if (brdf.diffuse)
+  //   brdfcos += brdf.diffuse * eval_diffuse_reflection(normal, outgoing, incoming);
+  if (brdf.specular)
+    brdfcos += brdf.specular * eval_delta_reflection(brdf.ior, normal, outgoing, incoming);
+  if (brdf.metal)
+    brdfcos += brdf.metal * eval_delta_reflection(brdf.meta, brdf.metak,
+                                        normal, outgoing, incoming);
+  if (brdf.transmission)
+    brdfcos += brdf.transmission * eval_delta_transmission(brdf.ior,
+                                    normal, outgoing, incoming);
+  return brdfcos;
 }
 
 // Picks a direction based on the BRDF
@@ -826,7 +837,7 @@ static vec3f sample_brdfcos(const ptr::brdf& brdf, const vec3f& normal,
   if (brdf.metal_pdf) {
     cdf += brdf.metal_pdf;
     if (rnl < cdf) 
-      return sample_microfacet_reflection(brdf.ior, brdf.roughness, normal, outgoing, rn); 
+      return sample_microfacet_reflection(brdf.meta, brdf.metak, brdf.roughness, normal, outgoing, rn); 
   }
   if (brdf.transmission_pdf) {
     cdf += brdf.transmission_pdf;
@@ -840,7 +851,24 @@ static vec3f sample_delta(const ptr::brdf& brdf, const vec3f& normal,
     const vec3f& outgoing, float rnl) {
   if (brdf.roughness) return zero3f;
   // YOUR CODE GOES HERE ------------------------------------------------------
-  return {};
+  auto cdf = 0.0f;
+  cdf += brdf.diffuse_pdf;
+  if (brdf.specular_pdf) {
+    cdf += brdf.specular_pdf;
+    if (rnl < cdf) 
+      return sample_delta_reflection(brdf.ior, normal, outgoing); 
+  }
+  if (brdf.metal_pdf) {
+    cdf += brdf.metal_pdf;
+    if (rnl < cdf) 
+      return sample_delta_reflection(brdf.meta, brdf.metak, normal, outgoing); 
+  }
+  if (brdf.transmission_pdf) {
+    cdf += brdf.transmission_pdf;
+    if (rnl < cdf)
+      return sample_delta_transmission(brdf.ior, normal, outgoing);
+  }
+  return zero3f;
 }
 
 // Compute the weight for sampling the BRDF
@@ -856,7 +884,7 @@ static float sample_brdfcos_pdf(const ptr::brdf& brdf, const vec3f& normal,
     pdf += brdf.specular_pdf*sample_microfacet_reflection_pdf(brdf.ior,brdf.roughness,normal,outgoing,incoming);
   }
   if (brdf.metal_pdf) {
-    pdf += brdf.metal_pdf*sample_microfacet_reflection_pdf(brdf.ior,brdf.roughness,normal,outgoing,incoming);
+    pdf += brdf.metal_pdf*sample_microfacet_reflection_pdf(brdf.meta, brdf.metak,brdf.roughness,normal,outgoing,incoming);
   }
   if (brdf.transmission_pdf) {
     pdf += brdf.transmission_pdf*
@@ -869,13 +897,52 @@ static float sample_delta_pdf(const ptr::brdf& brdf, const vec3f& normal,
     const vec3f& outgoing, const vec3f& incoming) {
   if (brdf.roughness) return 0;
   // YOUR CODE GOES HERE ------------------------------------------------------
-  return {};
+  auto pdf = 0.0f;
+  if (brdf.specular_pdf) {
+    pdf += brdf.specular_pdf*sample_delta_reflection_pdf(brdf.ior,normal,outgoing,incoming);
+  }
+  if (brdf.metal_pdf) {
+    pdf += brdf.metal_pdf*sample_delta_reflection_pdf(brdf.meta, brdf.metak,normal,outgoing,incoming);
+  }
+  if (brdf.transmission_pdf) {
+    pdf += brdf.transmission_pdf*
+            sample_delta_transmission_pdf(brdf.ior,normal,outgoing,incoming);
+  }
+  return pdf;
+  
 }
 
 // Sample lights wrt solid angle
 static vec3f sample_lights(const ptr::scene* scene, const vec3f& position,
     float rl, float rel, const vec2f& ruv) {
   // YOUR CODE GOES HERE ------------------------------------------------------
+  auto lid = sample_uniform(scene->lights.size(), rl);
+  auto light = scene->lights[lid];
+  if (light->object) {
+    // <handle object>
+    auto& object    = light->object;
+    auto  shape     = object->shape;
+    auto  frame     = object->frame;
+
+    auto tid        = sample_discrete_cdf(light->cdf, rel);
+    auto uv         = sample_triangle(ruv);
+    auto lposition  = eval_position(light->object, tid, uv);
+
+    return normalize(lposition - position);
+  } else if (light->environment) {
+    // <handle environment>
+    auto texture    = light->environment->emission_tex;
+    auto tid        = sample_discrete_cdf(light->cdf, rel);
+    auto size       = texture_size(texture);
+    auto uv         = vec2f{(tid % size.x + ruv.x) / size.x,
+                        (tid / size.x + ruv.y) / size.y};
+    auto& environment = light->environment;
+    return transform_direction(environment->frame,
+            {cos(uv.x * 2 * math::pi) * sin(uv.y * math::pi),
+            cos(uv.y * math::pi),
+            sin(uv.x * 2 * math::pi) * sin(uv.y * math::pi)});
+  }
+
   return {};
 }
 
@@ -883,7 +950,42 @@ static vec3f sample_lights(const ptr::scene* scene, const vec3f& position,
 static float sample_lights_pdf(
     const ptr::scene* scene, const vec3f& position, const vec3f& direction) {
   // YOUR CODE GOES HERE ------------------------------------------------------
-  return {};
+  auto pdf = 0.0f;
+  for (auto light : scene->lights) {
+    if (light->object) {
+      // <handle object>
+      // accumulate pdf over all intersections
+      auto lpdf = 0.0f; 
+      auto next_position = position;
+
+      for (auto bounce = 0; bounce < 100; bounce++) {
+        auto isec = intersect(light->object, next_position, direction);
+        if (!isec) 
+          break;
+
+        // compute pdf of this triangle
+        // auto [lp, ln] = eval_point(isec); //position, normal
+        
+        auto object   = scene->objects[isec.object];
+        auto element  = isec.element;
+        auto uv       = isec.uv;
+        auto outgoing = -direction;
+
+        auto lposition = eval_position(object, element, uv);
+        auto lnormal  = eval_shading_normal(object, element, uv, outgoing);
+        
+        // prob triangle * area triangle = area triangle mesh
+        auto area     = light->cdf.back();
+        lpdf += distance_squared(lposition, position) / (abs(dot(lnormal, direction)) * area);
+        next_position = lposition + direction * 1e-3f; // continue ray
+      }
+      pdf += lpdf;
+    } else if(light->environment) {
+      // <handle environment>
+    }
+  }
+  pdf *= sample_uniform_pdf(scene->lights.size());
+  return pdf;
 }
 
 // Path tracing.
@@ -897,16 +999,19 @@ static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
 static vec4f trace_naive(const ptr::scene* scene, const ray3f& ray_,
     rng_state& rng, const trace_params& params) {
   // YOUR CODE GOES HERE ------------------------------------------------------
-  auto l = vec4f{0}, w = vec4f{1};
-  ray3f ray = ray_;
-  for(auto bounce : yocto::common::range(params.bounces)) {
+  auto radiance = zero3f;
+  auto weight   = vec3f{1,1,1};
+  ray3f ray     = ray_;
+  auto hit      = false;
 
+  for(auto bounce : yocto::common::range(params.bounces)) {
+    // intersect next point
     auto isec = intersect_scene_bvh(scene, ray);
     if(!isec.hit) {
-      vec4f env = {eval_environment(scene, ray), 1};
-      l += w * env; 
+      radiance += weight * eval_environment(scene, ray); 
       break; 
     }
+
     auto object   = scene->objects[isec.object];
     auto element  = isec.element;
     auto uv       = isec.uv;
@@ -918,32 +1023,59 @@ static vec4f trace_naive(const ptr::scene* scene, const ray3f& ray_,
     auto normal   = eval_shading_normal(object, element, uv, outgoing);
     
     // auto [e, f] = eval_material(isec);   // eval emission, bsdf
-    auto f       = eval_brdf(object, element, uv, normal, outgoing);
-    vec4f emission = {eval_emission(object, element, uv, normal, outgoing),1};
-    l += w * emission;
-
-    // float i = 1;
+    auto brdf     = eval_brdf(object, element, uv, normal, outgoing);
+    auto emission = eval_emission(object, element, uv, normal, outgoing);
     
-    // emission
-    auto i = vec3f{0};
-    if(!is_delta(f)) { // sample smooth brdfs (fold cos into f)
-      i = sample_brdfcos(f,normal,outgoing, rand1f(rng),rand2f(rng)); // incoming
-      w *= {eval_brdfcos(f,normal,outgoing, i) / sample_brdfcos_pdf(f,normal,outgoing,i),1};
+    // handle opacity
+    if (brdf.opacity < 1 && rand1f(rng) >= brdf.opacity) {
+      ray = {p + ray.d * 1e-2f, ray.d};
+      bounce -= 1;
+      continue;
+    }
+    hit = true;
+
+    //accumulate emission
+    radiance += weight * eval_emission(emission, normal, outgoing);
+    
+    // auto incoming = vec3f{0};
+    auto incoming = sample_hemisphere_cos(normal, rand2f(rng));
+
+    // // brdf * light
+    // auto incoming = outgoing;
+    // radiance += weight * pif * eval_brdfcos(f, normal, outgoing, incoming);
+
+    if(!is_delta(brdf)) { 
+      // sample smooth brdfs (fold cos into f)
+      // auto incoming ??
+      incoming = sample_brdfcos(brdf,normal,outgoing, rand1f(rng),rand2f(rng)); // incoming
+      weight *= eval_brdfcos(brdf,normal,outgoing, incoming) / sample_brdfcos_pdf(brdf,normal,outgoing,incoming);
     } else {
       // sample sharp brdfs
-      i = sample_delta(f,normal,outgoing,rand1f(rng));
-      // incoming
-      w *= {eval_delta(f,normal,outgoing,i) / sample_delta_pdf(f,normal,outgoing,i),1};
+      incoming = sample_delta(brdf,normal,outgoing,rand1f(rng)); // incoming
+      weight *= eval_delta(brdf,normal,outgoing,incoming) / sample_delta_pdf(brdf,normal,outgoing,incoming);
     }
 
-    if(rand1f(rng) >= min(1.f,max(w))) break; // russian roulette
+    // check weight
+    if (weight == zero3f || !isfinite(weight)) break;
 
-    w *= 1 / min(1.f,max(w));
+    // russian roulette
+    if (yocto::math::rand1f(rng) >= min(1.f, max(weight))) 
+      break; 
+    
+    weight *= 1 / min(1.f, max(weight));
+
+    // updated russian roulette
+    // if (bounce > 3) {
+    //   auto rr_prob = min(1.f, max(weight));
+    //   if (rand1f(rng) > rr_prob) 
+    //     break;
+    //   weight *= 1 / rr_prob;
+    // }
 
     // update weight
-    ray = {p, i};  // recurse
+    ray = {p, incoming};  // recurse
   }
-  return l;
+  return {radiance, hit ? 1.0f : 0.0f};
 }
 
 // Eyelight for quick previewing.
