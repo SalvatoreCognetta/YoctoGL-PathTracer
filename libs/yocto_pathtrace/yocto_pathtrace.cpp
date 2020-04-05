@@ -925,7 +925,7 @@ static vec3f sample_lights(const ptr::scene* scene, const vec3f& position,
     auto  frame     = object->frame;
 
     auto tid        = sample_discrete_cdf(light->cdf, rel);
-    auto uv         = sample_triangle(ruv);
+    auto uv         = (!shape->triangles.empty()) ? sample_triangle(ruv) : ruv;
     auto lposition  = eval_position(light->object, tid, uv);
 
     return normalize(lposition - position);
@@ -938,9 +938,9 @@ static vec3f sample_lights(const ptr::scene* scene, const vec3f& position,
                         (tid / size.x + ruv.y) / size.y};
     auto& environment = light->environment;
     return transform_direction(environment->frame,
-            {cos(uv.x * 2 * math::pi) * sin(uv.y * math::pi),
-            cos(uv.y * math::pi),
-            sin(uv.x * 2 * math::pi) * sin(uv.y * math::pi)});
+            {cos(uv.x * 2 * pif) * sin(uv.y * pif),
+            cos(uv.y * pif),
+            sin(uv.x * 2 * pif) * sin(uv.y * pif)});
   }
 
   return {};
@@ -957,16 +957,17 @@ static float sample_lights_pdf(
       // accumulate pdf over all intersections
       auto lpdf = 0.0f; 
       auto next_position = position;
+      auto object        = light->object; 
 
       for (auto bounce = 0; bounce < 100; bounce++) {
-        auto isec = intersect(light->object, next_position, direction);
-        if (!isec) 
+        auto isec = intersect_instance_bvh(light->object, {next_position, direction});
+        if (!isec.hit) 
           break;
 
         // compute pdf of this triangle
         // auto [lp, ln] = eval_point(isec); //position, normal
         
-        auto object   = scene->objects[isec.object];
+        // auto object   = scene->objects[isec.object];
         auto element  = isec.element;
         auto uv       = isec.uv;
         auto outgoing = -direction;
@@ -982,6 +983,22 @@ static float sample_lights_pdf(
       pdf += lpdf;
     } else if(light->environment) {
       // <handle environment>
+      auto texture = light->environment->emission_tex;
+      auto size = texture_size(texture);
+      auto wl = transform_direction(inverse(light->environment->frame), direction);
+      auto texcoord = vec2f{atan2(wl.z, wl.x) / (2 * pif),
+                        acos(clamp(wl.y, -1.0f, 1.0f)) / pif};
+      if (texcoord.x < 0) 
+        texcoord.x += 1;
+
+      auto i      = clamp((int)(texcoord.x * size.x), 0, size.x - 1);
+      auto j      = clamp((int)(texcoord.y * size.y), 0, size.y - 1);
+      auto prob   = sample_discrete_cdf_pdf(light->cdf, j*size.x+i) /
+                    light->cdf.back();
+      auto angle  = (2 * pif / size.x) * (pif / size.y) *
+                      sin(pif * (j + 0.5f) / size.y);
+
+      pdf += prob / angle;
     }
   }
   pdf *= sample_uniform_pdf(scene->lights.size());
@@ -992,7 +1009,95 @@ static float sample_lights_pdf(
 static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
     rng_state& rng, const trace_params& params) {
   // YOUR CODE GOES HERE ------------------------------------------------------
-  return {};
+  auto radiance = zero3f;
+  auto weight   = vec3f{1,1,1};
+  ray3f ray     = ray_;
+  auto hit      = false;
+
+  for(auto bounce : yocto::common::range(params.bounces)) {
+    // intersect next point
+    auto isec = intersect_scene_bvh(scene, ray);
+    if(!isec.hit) {
+      radiance += weight * eval_environment(scene, ray); 
+      break; 
+    }
+
+    auto object   = scene->objects[isec.object];
+    auto element  = isec.element;
+    auto uv       = isec.uv;
+    // outgoing
+    auto outgoing = -ray.d;
+
+    // auto [p, n] = eval_point(scene, isec, ray); // eval pos, norm
+    auto p        = eval_position(object, element, uv);
+    auto normal   = eval_shading_normal(object, element, uv, outgoing);
+    
+    // auto [e, f] = eval_material(isec);   // eval emission, bsdf
+    auto brdf     = eval_brdf(object, element, uv, normal, outgoing);
+    auto emission = eval_emission(object, element, uv, normal, outgoing);
+    
+    // handle opacity
+    if (brdf.opacity < 1 && rand1f(rng) >= brdf.opacity) {
+      ray = {p + ray.d * 1e-2f, ray.d};
+      bounce -= 1;
+      continue;
+    }
+    hit = true;
+
+    //accumulate emission
+    radiance += weight * eval_emission(emission, normal, outgoing);
+    
+    // auto incoming = vec3f{0};
+    auto incoming = sample_hemisphere_cos(normal, rand2f(rng));
+
+    // // brdf * light
+    // auto incoming = outgoing;
+    // radiance += weight * pif * eval_brdfcos(f, normal, outgoing, incoming);
+
+    if(!is_delta(brdf)) { 
+      // sample smooth brdfs (fold cos into f)
+      incoming = rand1f(rng) < 0.5 ?
+                  sample_brdfcos(brdf,normal,outgoing,rand1f(rng),rand2f(rng)) :
+                  sample_lights(scene, p,rand1f(rng),rand1f(rng),rand2f(rng));
+      weight *= eval_brdfcos(brdf,normal,outgoing,incoming) * 2 /
+                  (sample_brdfcos_pdf(brdf,normal,outgoing,incoming)+sample_lights_pdf(scene,p,incoming));
+
+      // incoming = sample_brdfcos(brdf,normal,outgoing, rand1f(rng),rand2f(rng)); // incoming
+      // weight *= eval_brdfcos(brdf,normal,outgoing, incoming) / sample_brdfcos_pdf(brdf,normal,outgoing,incoming);
+    } else {
+      // sample sharp brdfs
+      incoming = sample_delta(brdf,normal,outgoing,rand1f(rng)); // incoming
+      weight *= eval_delta(brdf,normal,outgoing,incoming) / sample_delta_pdf(brdf,normal,outgoing,incoming);
+    }
+
+    // check weight
+    if (weight == zero3f || !isfinite(weight)) break;
+
+    // russian roulette
+    // if (yocto::math::rand1f(rng) >= min(1.f, max(weight))) 
+    //   break; 
+    
+    // weight *= 1 / min(1.f, max(weight));
+
+    // // updated russian roulette
+    // if (bounce > 3) {
+    //   auto rr_prob = min(1.f, max(weight));
+    //   if (rand1f(rng) > rr_prob) 
+    //     break;
+    //   weight *= 1 / rr_prob;
+    // }
+
+    // russian roulette
+    if (max(weight) < 1 && bounce > 3) {
+      auto rr_prob = max((float)0.05, 1 - max(weight));
+      if (rand1f(rng) > rr_prob) break;
+      weight *= 1 / rr_prob;
+    }
+
+    // update weight
+    ray = {p, incoming};  // recurse
+  }
+  return {radiance, hit ? 1.0f : 0.0f};
 }
 
 // Recursive path tracing.
@@ -1058,19 +1163,26 @@ static vec4f trace_naive(const ptr::scene* scene, const ray3f& ray_,
     // check weight
     if (weight == zero3f || !isfinite(weight)) break;
 
-    // russian roulette
-    if (yocto::math::rand1f(rng) >= min(1.f, max(weight))) 
-      break; 
+    // // russian roulette
+    // if (yocto::math::rand1f(rng) >= min(1.f, max(weight))) 
+    //   break; 
     
-    weight *= 1 / min(1.f, max(weight));
+    // weight *= 1 / min(1.f, max(weight));
 
-    // updated russian roulette
+    // // updated russian roulette
     // if (bounce > 3) {
     //   auto rr_prob = min(1.f, max(weight));
     //   if (rand1f(rng) > rr_prob) 
     //     break;
     //   weight *= 1 / rr_prob;
     // }
+
+    // russian roulette
+    if (max(weight) < 1 && bounce > 3) {
+      auto rr_prob = max((float)0.05, 1 - max(weight));
+      if (rand1f(rng) > rr_prob) break;
+      weight *= 1 / rr_prob;
+    }
 
     // update weight
     ray = {p, incoming};  // recurse
