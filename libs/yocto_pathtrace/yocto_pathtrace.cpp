@@ -797,6 +797,9 @@ static vec3f eval_brdfcos(const ptr::brdf& brdf, const vec3f& normal,
   if (brdf.transmission)
     brdfcos += brdf.transmission * eval_microfacet_transmission(brdf.ior,
                                     brdf.roughness, normal, outgoing, incoming);
+  if (brdf.refraction)
+    brdfcos += brdf.refraction * eval_microfacet_refraction(brdf.ior,
+                                  brdf.roughness, normal, outgoing, incoming);
   return brdfcos;
 }
 
@@ -815,6 +818,9 @@ static vec3f eval_delta(const ptr::brdf& brdf, const vec3f& normal,
   if (brdf.transmission)
     brdfcos += brdf.transmission * eval_delta_transmission(brdf.ior,
                                     normal, outgoing, incoming);
+  if (brdf.refraction)
+    brdfcos += brdf.refraction * eval_delta_refraction(brdf.ior,
+                                  normal, outgoing, incoming);
   return brdfcos;
 }
 
@@ -844,6 +850,12 @@ static vec3f sample_brdfcos(const ptr::brdf& brdf, const vec3f& normal,
     if (rnl < cdf)
       return sample_microfacet_transmission(brdf.ior, brdf.roughness, normal, outgoing, rn);
   }
+  if (brdf.refraction_pdf) {
+    cdf += brdf.refraction_pdf;
+    if (rnl < cdf)
+      return sample_microfacet_refraction(brdf.ior, brdf.roughness, normal, outgoing, rnl, rn);
+  }
+
   return zero3f;
 }
 
@@ -868,6 +880,12 @@ static vec3f sample_delta(const ptr::brdf& brdf, const vec3f& normal,
     if (rnl < cdf)
       return sample_delta_transmission(brdf.ior, normal, outgoing);
   }
+  if (brdf.refraction_pdf) {
+    cdf += brdf.refraction_pdf;
+    if (rnl < cdf) {
+      return sample_delta_refraction(brdf.ior, normal, outgoing, rnl);
+    }
+  }
   return zero3f;
 }
 
@@ -890,6 +908,10 @@ static float sample_brdfcos_pdf(const ptr::brdf& brdf, const vec3f& normal,
     pdf += brdf.transmission_pdf*
             sample_microfacet_transmission_pdf(brdf.ior,brdf.roughness,normal,outgoing,incoming);
   }
+  if (brdf.refraction_pdf) {
+    pdf += brdf.refraction_pdf*
+            sample_microfacet_refraction_pdf(brdf.ior,brdf.roughness, normal,outgoing, incoming);
+  }
   return pdf;
 }
 
@@ -907,6 +929,10 @@ static float sample_delta_pdf(const ptr::brdf& brdf, const vec3f& normal,
   if (brdf.transmission_pdf) {
     pdf += brdf.transmission_pdf*
             sample_delta_transmission_pdf(brdf.ior,normal,outgoing,incoming);
+  }
+  if (brdf.refraction_pdf) {
+    pdf += brdf.refraction_pdf*
+            sample_delta_refraction_pdf(brdf.ior,normal, outgoing,incoming);
   }
   return pdf;
   
